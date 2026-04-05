@@ -4,17 +4,10 @@
 	{% include "templates/includes/meta_block.html" %}
 {% endblock %}
 
-{% block navbar %}
-	{% if not hide_navbar %}
-        {% include "templates/includes/navbar/navbar.html" %}
-	{% endif %}
-{% endblock %}
-
-{% block footer %}
-	{% if not hide_footer %}
-        {% include "templates/includes/footer/footer.html" %}
-	{% endif %}
-{% endblock %}
+{# Navbar and footer: inherit from web.html (renders Web Template if set in Website Settings).
+   The original web_form.html overrode these blocks with standard includes, bypassing Web Templates.
+   Removed so Floreer's custom navbar/footer Web Templates render on web form pages.
+   hide_navbar/hide_footer are respected by the base template's rendering logic. #}
 
 {% block breadcrumbs %}{% endblock %}
 
