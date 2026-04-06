@@ -206,6 +206,7 @@ def get_list_context(context=None):
 	return {
 		"title": _("Addresses"),
 		"get_list": get_address_list,
+		"list_template": "templates/includes/list/list.html",
 		"row_template": "templates/includes/address_row.html",
 		"no_breadcrumbs": True,
 	}
