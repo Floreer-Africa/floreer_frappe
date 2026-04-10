@@ -186,7 +186,7 @@ class EmailQueue(Document):
 				msg = raw_message if isinstance(raw_message, bytes) else raw_message.encode("utf-8")
 
 				if ctx.smtp_server.session.has_extn("SIZE"):
-					if max_size := ctx.smtp_server.session.esmtp_features.get("size"):
+					if (max_size := ctx.smtp_server.session.esmtp_features.get("size")) and int(max_size) > 0:
 						max_size = int(max_size)
 						msg_size = len(msg)
 
