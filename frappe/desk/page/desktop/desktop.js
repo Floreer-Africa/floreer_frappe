@@ -1034,7 +1034,8 @@ class DesktopIcon {
 	setup_click() {
 		const me = this;
 		if (this.child_icons?.length && (this.icon_type == "App" || this.icon_type == "Folder")) {
-			$(this.icon).on("click", () => {
+			$(this.icon).on("click", (event) => {
+				event.preventDefault();
 				let modal = frappe.desktop_utils.create_desktop_modal(me);
 				modal.setup(me.icon_title, me.child_icons, 4);
 				let $title = modal.modal.find(".modal-title");
@@ -1162,6 +1163,11 @@ class DesktopModal {
 			this.modal.find(".modal-dialog").attr("id", "desktop-modal");
 			this.modal.find(".modal-body").addClass("desktop-modal-body");
 			this.$child_icons_wrapper = this.modal.find(".desktop-modal-body");
+			this.modal.find(".desktop-modal-heading").on("click", (e) => {
+				if (!$(e.target).closest(".modal-title").length) {
+					this.hide();
+				}
+			});
 		} else {
 			this.modal.find(".modal-title").text(icon_title);
 			$(this.modal.find(".modal-body")).empty();
