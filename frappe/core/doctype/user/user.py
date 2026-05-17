@@ -212,8 +212,8 @@ class User(Document):
 		frappe.cache.delete_key("enabled_users")
 
 	def validate(self):
-		# clear new password
-		self.__new_password = self.new_password
+		if self.new_password:
+			self.__new_password = self.new_password
 		self.new_password = ""
 
 		if not frappe.in_test:
@@ -282,6 +282,10 @@ class User(Document):
 		"""This handles old role_profile_name field if programatically set.
 
 		This behaviour will be removed in future versions."""
+		if not self.role_profiles:
+			self.role_profile_name = None
+			return
+
 		if not self.role_profile_name:
 			return
 
