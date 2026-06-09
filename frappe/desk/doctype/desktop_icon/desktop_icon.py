@@ -13,6 +13,20 @@ from frappe.modules.import_file import import_file_by_path
 from frappe.modules.utils import create_directory_on_app_path, get_app_level_directory_path
 
 
+def is_desk_route(route: str | None) -> bool:
+	return bool(route and route.startswith("/desk"))
+
+
+def should_hide_workspace_icon(app_route: str | None, workspace_label: str, app_title: str) -> bool:
+	if not app_route:
+		return False
+
+	if not is_desk_route(app_route):
+		return True
+
+	return workspace_label == app_title
+
+
 class DesktopIcon(Document):
 	_DOCTYPE_NAME = "Desktop Icon"
 
@@ -223,17 +237,10 @@ def create_desktop_icons_from_workspace():
 				if app_icon:
 					icon.parent_icon = app_icon
 
-				# Portal App With Desk Workspace
-				if frappe.db.get_value("Desktop Icon", app_icon, "link") and not frappe.db.get_value(
-					"Desktop Icon", app_icon, "link"
-				).startswith("/app"):
-					icon.hidden = 1
-					icon.parent_icon = None
+				app_route = frappe.db.get_value("Desktop Icon", app_icon, "link") if app_icon else None
 
-				# If Desk App has one workspace with the same name
-				if icon.label == app_title and (
-					app_icon and frappe.db.get_value("Desktop Icon", app_icon, "link").startswith("/app")
-				):
+				# Portal App With Desk Workspace
+				if should_hide_workspace_icon(app_route, icon.label, app_title):
 					icon.hidden = 1
 					icon.parent_icon = None
 
