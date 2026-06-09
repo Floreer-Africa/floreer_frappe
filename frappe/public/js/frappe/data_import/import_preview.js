@@ -69,12 +69,14 @@ frappe.data_import.ImportPreview = class ImportPreview {
 					column_width += 50;
 				}
 				let column_title = `<span class="indicator red">
-					${col.header_title || `<i>${__("Untitled Column")}</i>`}
+					${frappe.utils.escape_html(col.header_title) || `<i>${__("Untitled Column")}</i>`}
 					${!col.df ? show_warnings_button : ""}
 				</span>`;
 				return {
 					id: frappe.utils.get_random(6),
-					name: col.header_title || (df ? df.label : "Untitled Column"),
+					name:
+						frappe.utils.escape_html(col.header_title) ||
+						(df ? df.label : "Untitled Column"),
 					content: column_title,
 					skip_import: true,
 					editable: false,
@@ -98,13 +100,13 @@ frappe.data_import.ImportPreview = class ImportPreview {
 				: null;
 
 			let column_title = `<span class="indicator green">
-				${col.header_title || df.label}
+				${frappe.utils.escape_html(col.header_title) || df.label}
 				${date_format ? `(${date_format})` : ""}
 			</span>`;
 
 			return {
 				id: df.fieldname,
-				name: col.header_title,
+				name: frappe.utils.escape_html(col.header_title),
 				content: column_title,
 				df: df,
 				editable: false,
@@ -137,7 +139,7 @@ frappe.data_import.ImportPreview = class ImportPreview {
 		this.datatable = new DataTable(this.$table_preview.get(0), {
 			data: this.data,
 			columns: this.columns,
-			layout: this.columns.length < 10 ? "fluid" : "fixed",
+			layout: "fixed",
 			cellHeight: 35,
 			language: frappe.boot.lang,
 			translations: frappe.utils.datatable.get_translations(),
@@ -147,15 +149,7 @@ frappe.data_import.ImportPreview = class ImportPreview {
 			disableReorderColumn: true,
 		});
 
-		let { max_rows_exceeded, max_rows_in_preview, total_number_of_rows } = this.preview_data;
-		if (max_rows_exceeded) {
-			let parts = [max_rows_in_preview, total_number_of_rows];
-			this.wrapper.find(".table-message").html(`
-				<div class="text-muted margin-top text-medium">
-				${__("Showing only first {0} rows out of {1}", parts)}
-				</div>
-			`);
-		}
+		this.render_table_message();
 
 		if (this.data.length === 0) {
 			this.datatable.style.setStyle(".dt-scrollable", {
@@ -166,6 +160,28 @@ frappe.data_import.ImportPreview = class ImportPreview {
 		this.datatable.style.setStyle(".dt-dropdown", {
 			display: "none",
 		});
+	}
+
+	/** Row count below the preview table (always shown when data exists). */
+	render_table_message() {
+		const $message = this.wrapper.find(".table-message");
+		if (!this.data.length) {
+			$message.empty();
+			return;
+		}
+
+		const { max_rows_exceeded, max_rows_in_preview, total_number_of_rows } = this.preview_data;
+		const total = total_number_of_rows ?? this.data.length;
+		let text;
+		if (max_rows_exceeded) {
+			text = __("Showing only first {0} rows out of {1}", [max_rows_in_preview, total]);
+		} else {
+			text = total === 1 ? __("1 row") : __("Showing all {0} rows", [total]);
+		}
+
+		$message.html(`
+			<div class="text-muted margin-top text-medium">${text}</div>
+		`);
 	}
 
 	setup_styles() {
@@ -203,7 +219,9 @@ frappe.data_import.ImportPreview = class ImportPreview {
 			{
 				label: __("Show Warnings"),
 				handler: "show_warnings",
-				condition: this.preview_data.warnings.length > 0,
+				condition:
+					this.preview_data.warnings.length > 0 &&
+					!["Success", "Partial Success"].includes(this.frm.doc.status),
 			},
 		];
 
