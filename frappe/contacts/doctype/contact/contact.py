@@ -132,8 +132,11 @@ class Contact(Document):
 			self.email_id = ""
 			return
 
-		if len([email.email_id for email in self.email_ids if email.is_primary]) > 1:
-			frappe.throw(_("Only one {0} can be set as primary.").format(frappe.bold(_("Email ID"))))
+		primary_emails = [email for email in self.email_ids if email.is_primary]
+		if len(primary_emails) > 1:
+			# Auto-fix: keep only the first primary, unset the rest
+			for extra in primary_emails[1:]:
+				extra.is_primary = 0
 
 		if len(self.email_ids) == 1:
 			self.email_ids[0].is_primary = 1
@@ -156,12 +159,12 @@ class Contact(Document):
 
 		field_name = "is_primary_" + fieldname
 
-		is_primary = [phone.phone for phone in self.phone_nos if phone.get(field_name)]
+		is_primary = [phone for phone in self.phone_nos if phone.get(field_name)]
 
 		if len(is_primary) > 1:
-			frappe.throw(
-				_("Only one {0} can be set as primary.").format(frappe.bold(frappe.unscrub(fieldname)))
-			)
+			# Auto-fix: keep only the first primary, unset the rest
+			for phone in is_primary[1:]:
+				phone.set(field_name, 0)
 
 		primary_number_exists = False
 		for d in self.phone_nos:
@@ -337,6 +340,8 @@ def get_contact_details(contact: str):
 
 def update_contact(doc, method):
 	"""Update contact when user is updated, if contact is found. Called via hooks"""
+	if getattr(frappe.flags, "skip_contact_update", False):
+		return
 	contact_name = frappe.db.get_value("Contact", {"email_id": doc.name})
 	if contact_name:
 		contact = frappe.get_doc("Contact", contact_name)

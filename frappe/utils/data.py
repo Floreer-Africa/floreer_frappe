@@ -2669,7 +2669,17 @@ def orjson_dumps(obj, default=None, option=None, decode=True):
 	else:
 		option = DEFAULT_ORJSON_OPTIONS
 
-	value = orjson.dumps(obj, default, option)
+	try:
+		value = orjson.dumps(obj, default, option)
+	except TypeError as e:
+		# framework#23: orjson cannot encode ints outside the signed 64-bit range
+		# (e.g. zxcvbn password "guesses"). Fall back to stdlib json — Frappe's
+		# pre-orjson serializer, which supports arbitrary-precision ints — using the
+		# SAME default callable so datetimes etc. still serialize. Re-raise others.
+		if "64-bit range" not in str(e):
+			raise
+		import json as _json
+		value = _json.dumps(obj, default=default).encode()
 	return value.decode() if decode else value
 
 

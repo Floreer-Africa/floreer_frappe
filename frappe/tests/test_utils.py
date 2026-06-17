@@ -1014,6 +1014,33 @@ class TestResponse(IntegrationTestCase):
 		with self.assertRaises(TypeError):
 			json.dumps(BAD_OBJECT, default=json_handler)
 
+	def test_orjson_dumps_big_int_fallback(self):
+		"""orjson cannot encode ints outside the signed 64-bit range; orjson_dumps
+		must fall back to stdlib json (preserving the value) instead of raising.
+		Regression for framework#23 — zxcvbn 'guesses' routinely exceed 2**64, which
+		made strong-password (test_password_strength) responses 500."""
+		import orjson
+
+		from frappe.utils.data import orjson_dumps
+
+		big = 10**20  # outside orjson's signed-64-bit range
+		# Raw orjson genuinely cannot encode it — the bug this fix guards against.
+		with self.assertRaises(TypeError):
+			orjson.dumps(big)
+
+		# orjson_dumps falls back to stdlib json and preserves the exact integer.
+		self.assertEqual(json.loads(orjson_dumps(big)), big)
+
+		# Mixed payload: the big int forces the stdlib fallback, and a datetime in the
+		# same payload must still serialize via the same default (json_handler).
+		payload = {"guesses": big, "when": datetime(2026, 6, 17, 12, 0, 0)}
+		decoded = json.loads(orjson_dumps(payload, default=json_handler))
+		self.assertEqual(decoded["guesses"], big)
+		self.assertIsInstance(decoded["when"], str)
+
+		# In-range payloads still use the orjson fast path unchanged.
+		self.assertEqual(json.loads(orjson_dumps({"n": 42})), {"n": 42})
+
 
 class TestTimeDeltaUtils(IntegrationTestCase):
 	def test_format_timedelta(self):

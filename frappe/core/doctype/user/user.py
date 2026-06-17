@@ -989,13 +989,13 @@ def update_password(
 
 	user_doc.validate_reset_password()
 
-	# get redirect url from cache
+	frappe.local.login_manager.login_as(user)
+
+	# get redirect url from cache (after login_as so on_session_creation hooks have run)
 	redirect_to = frappe.cache.hget("redirect_after_login", user)
 	if redirect_to:
 		redirect_url = redirect_to
 		frappe.cache.hdel("redirect_after_login", user)
-
-	frappe.local.login_manager.login_as(user)
 
 	frappe.db.set_value("User", user, "last_password_reset_date", today())
 	frappe.db.set_value("User", user, "reset_password_key", "")
