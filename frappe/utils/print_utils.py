@@ -51,8 +51,16 @@ def get_print(
 	if "pdf_generator" not in local.form_dict:
 		# if arg is passed, use that, else get setting from print format
 		if pdf_generator is None:
+			# Fall back to the global Print Settings PDF Generator before wkhtmltopdf, so
+			# background/email PDFs (attach_print never passes a generator) honour the Print
+			# Settings dropdown. Upstream only consults the per-Print-Format field, leaving
+			# Standard formats on wkhtmltopdf — which fatally fails when print assets aren't
+			# reachable from the backend container. Backported from icff-project/framework#137.
+			# Re-apply after upstream sync.
 			pdf_generator = (
-				frappe.get_cached_value("Print Format", print_format, "pdf_generator") or "wkhtmltopdf"
+				frappe.get_cached_value("Print Format", print_format, "pdf_generator")
+				or frappe.db.get_single_value("Print Settings", "pdf_generator")
+				or "wkhtmltopdf"
 			)
 		local.form_dict.pdf_generator = pdf_generator
 
