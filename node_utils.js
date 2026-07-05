@@ -59,17 +59,48 @@ function get_conf() {
 function get_redis_subscriber(kind = "redis_queue", options = {}) {
 	const conf = get_conf();
 	const connStr = conf[kind];
+	// PR-Foundry fork patch (framework#67): make the realtime redis client
+	// resilient to a transient redis blip (restart / network hiccup).
+	//
+	// 1. reconnectStrategy: reconnect on a transient blip (node-redis v4 restores
+	//    subscriptions automatically on reconnect, so realtime self-heals), but
+	//    GIVE UP after a bounded number of tries so a genuinely unreachable redis
+	//    fails fast — retrying forever hangs `bench build`, which has no redis.
+	// 2. an "error" handler: @redis/client emits "error" on a dropped/refused
+	//    connection, and an UNHANDLED "error" on a Node EventEmitter is FATAL —
+	//    it crashes the socketio process, which then sits dead (the container
+	//    does not exit, so `restart: unless-stopped` never fires) until someone
+	//    restarts it by hand. Handling it keeps the process alive to reconnect.
+	//
+	// Upstream-owned file: a frappe upstream-sync can reset this — re-verify
+	// get_redis_subscriber still attaches the error handler after any sync.
+	const { socket: socketOverrides, ...restOptions } = options;
+	const socket = {
+		// Reconnect on a transient blip (redis restart / network hiccup), but GIVE
+		// UP after ~20 tries so a genuinely unreachable redis fails fast instead of
+		// retrying forever. Retrying forever would HANG `bench build` (which has no
+		// redis) — before this patch the unhandled error crashed that process and
+		// the build tolerated it. On give-up the connect promise rejects and the
+		// process exits, so the socketio container's restart policy recreates it
+		// and retries fresh; a transient blip reconnects well within the window.
+		reconnectStrategy: (retries) =>
+			retries > 20
+				? new Error("redis unreachable — giving up after 20 reconnect attempts")
+				: Math.min(retries * 200, 2000),
+		...(socketOverrides || {}),
+	};
 	let client;
-	// TODO: revise after https://github.com/redis/node-redis/issues/2530
-	// is solved for a more elegant implementation
 	if (connStr && connStr.startsWith("unix://")) {
 		client = redis.createClient({
-			socket: { path: connStr.replace("unix://", "") },
-			...options,
+			socket: { path: connStr.replace("unix://", ""), ...socket },
+			...restOptions,
 		});
 	} else {
-		client = redis.createClient({ url: connStr, ...options });
+		client = redis.createClient({ url: connStr, socket, ...restOptions });
 	}
+	client.on("error", (err) => {
+		console.error(`[frappe-realtime] redis(${kind}) client error:`, err?.message || err);
+	});
 	return client;
 }
 
