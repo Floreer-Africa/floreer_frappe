@@ -210,6 +210,11 @@ def get_list_context(context=None):
 		"get_list": get_address_list,
 		"list_template": "templates/includes/list/list.html",
 		"row_template": "templates/includes/address_row.html",
+		# PR-Foundry fork patch (framework#25): without list_template the
+		# /addresses portal list page falls back to default rendering instead of
+		# the standard portal list wrapper. General fix (absent upstream); an
+		# upstream frappe sync can drop this — re-verify after any frappe sync.
+		"list_template": "templates/includes/list/list.html",
 		"no_breadcrumbs": True,
 	}
 
