@@ -45,6 +45,32 @@ def resolve_intercepted_public_path(clean_path: str) -> tuple[str, bool]:
 	return final_system_path, is_safe
 
 
+def classify_intercepted_path(clean_path: str) -> tuple[str, str]:
+	"""Decide how the PDF generator should handle an intercepted same-host
+	sub-resource. Returns ``(final_system_path, action)`` where ``action`` is:
+
+	- ``"serve"`` — inside the servable tree AND a real file: read + fulfill it.
+	- ``"block"`` — outside the tree (a path-traversal escape): fail the request.
+	- ``"continue"`` — inside the tree but NOT a servable file (the url resolved to
+	  a directory, e.g. the ``public/`` root, or the file is missing): let Chrome
+	  fetch it normally. ``resolve_intercepted_public_path`` reports such a path as
+	  safe (it is within ``public/``), but calling ``frappe.read_file`` on a
+	  non-file raises ``IsADirectoryError`` / ``FileNotFoundError`` and crashes the
+	  CDP listener thread — the render future never resolves and the request hangs
+	  with its DB locks still held. This split keeps a bad sub-resource url from
+	  taking down the whole render (Floreer-Africa/framework#125). Guarded by
+	  ``floreer_app.tests.test_pdf_generator_public_path``.
+	"""
+	import os
+
+	final_system_path, is_safe = resolve_intercepted_public_path(clean_path)
+	if not is_safe:
+		return final_system_path, "block"
+	if os.path.isfile(final_system_path):
+		return final_system_path, "serve"
+	return final_system_path, "continue"
+
+
 class Page:
 	def __init__(self, session, browser_context_id, page_type):
 		self.session = session
@@ -163,9 +189,9 @@ class Page:
 					path = url.replace(get_host_url(), "").split("?v", 1)[0]
 					clean_path = urllib.parse.unquote(path)
 
-					final_system_path, is_safe = resolve_intercepted_public_path(clean_path)
+					final_system_path, action = classify_intercepted_path(clean_path)
 
-					if is_safe:
+					if action == "serve":
 						content = frappe.read_file(final_system_path, as_base64=True)
 						response_headers = []
 						# write logic to handle all file types as required
@@ -183,7 +209,7 @@ class Page:
 								return_future=True,
 							)
 							return
-					elif path:
+					elif action == "block" and path:
 						self.session.send(
 							"Fetch.failRequest",
 							{"requestId": data["request_id"], "errorReason": "AccessDenied"},
