@@ -11,6 +11,40 @@ https://chromedevtools.github.io/devtools-protocol/
 """
 
 
+def resolve_intercepted_public_path(clean_path: str) -> tuple[str, bool]:
+	"""Resolve a same-host resource intercepted during PDF generation and report
+	whether it stays inside the site's servable tree.
+
+	Returns ``(final_system_path, is_safe)``. ``is_safe`` is True when the
+	resolved path is inside the bench ``assets/`` tree (for ``assets/…`` urls) or
+	anywhere under the site's ``public/`` root (everything else).
+
+	PR-Foundry/framework#83 (fork patch) — the non-asset branch previously
+	required the path under ``public/files`` (native Frappe uploads). Apps that
+	serve public files from another sub-tree — notably ``dfp_external_storage``,
+	which rewrites external-storage File urls to ``/file/<name>/<filename>`` —
+	fell outside that and were hard-blocked (``Fetch.failRequest``). A blocked
+	sub-resource aborts the headless print and surfaces as ``KeyError: 'result'``
+	in ``get_pdf_stream_id``, so e.g. a POS invoice embedding a webshop product
+	image never emails. Widening the boundary to the whole ``public/`` root lets
+	those render (or fall through to an HTTP fetch) while still blocking
+	path-traversal escapes outside ``public/`` / ``assets/``. Upstream-owned line
+	— re-verify after any frappe sync. Guarded by
+	``client_app.tests.test_pdf_generator_public_path``.
+	"""
+	import os
+
+	bench_sites = os.path.abspath(os.path.join(frappe.utils.get_bench_path(), "sites"))
+	if clean_path.startswith("assets/"):
+		base = os.path.abspath(os.path.join(bench_sites, "assets"))
+		final_system_path = os.path.abspath(os.path.join(bench_sites, clean_path))
+	else:
+		base = os.path.realpath(frappe.utils.get_site_path("public"))
+		final_system_path = os.path.realpath(os.path.join(base, clean_path))
+	is_safe = os.path.commonpath([final_system_path, base]) == base
+	return final_system_path, is_safe
+
+
 class Page:
 	def __init__(self, session, browser_context_id, page_type):
 		self.session = session
@@ -116,14 +150,7 @@ class Page:
 
 	def intercept_request_for_local_resources(self, url_pattern="*"):
 		"""Starts intercepting network requests for the given target_id and URL pattern."""
-		import os
-
 		data = {}
-
-		bench_sites = os.path.abspath(os.path.join(frappe.utils.get_bench_path(), "sites"))
-		asset_path = os.path.abspath(os.path.join(bench_sites, "assets"))
-		site_public_root = os.path.realpath(frappe.utils.get_site_path("public"))
-		files_path = os.path.realpath(frappe.utils.get_site_path("public", "files"))
 
 		def on_request_paused_event(future, response):
 			"""Callback for when a request is paused (intercepted)."""
@@ -136,12 +163,7 @@ class Page:
 					path = url.replace(get_host_url(), "").split("?v", 1)[0]
 					clean_path = urllib.parse.unquote(path)
 
-					if clean_path.startswith("assets/"):
-						final_system_path = os.path.abspath(os.path.join(bench_sites, clean_path))
-						is_safe = os.path.commonpath([final_system_path, asset_path]) == asset_path
-					else:
-						final_system_path = os.path.realpath(os.path.join(site_public_root, clean_path))
-						is_safe = os.path.commonpath([final_system_path, files_path]) == files_path
+					final_system_path, is_safe = resolve_intercepted_public_path(clean_path)
 
 					if is_safe:
 						content = frappe.read_file(final_system_path, as_base64=True)

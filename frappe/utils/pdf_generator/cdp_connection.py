@@ -37,6 +37,19 @@ class CDPSocketClient:
 		try:
 			async for message in self.connection:
 				self._handle_message(frappe.json.loads(message))
+		except (websockets.ConnectionClosed, GeneratorExit, asyncio.CancelledError):
+			# PR-Foundry/framework#85 (fork patch) — normal teardown: the CDP
+			# connection closes / the listen task is cancelled once the PDF render
+			# completes. Not a fault; don't spam the Error Log.
+			pass
+		except RuntimeError as e:
+			# "Event loop is closed" — the render finished and the loop was torn
+			# down while this listener was still awaiting a frame. Benign teardown
+			# race; only a genuinely unexpected RuntimeError is worth logging.
+			if "Event loop is closed" not in str(e):
+				frappe.log_error(
+					title="WebSocket listening error:", message=f"{frappe.get_traceback()}"
+				)
 		except Exception:
 			frappe.log_error(title="WebSocket listening error:", message=f"{frappe.get_traceback()}")
 
