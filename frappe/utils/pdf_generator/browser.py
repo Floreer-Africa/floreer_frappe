@@ -40,9 +40,22 @@ class Browser:
 
 			if self.header_page:
 				if not self.is_header_dynamic:
-					self.header_pdf = self.header_page.get_pdf_from_stream(
-						self.header_page.get_pdf_stream_id()
-					)
+					try:
+						self.header_pdf = self.header_page.get_pdf_from_stream(
+							self.header_page.get_pdf_stream_id()
+						)
+					except Exception:
+						# framework#90 — the async (non-dynamic) header render can
+						# resolve with no result (near-empty header with no letterhead,
+						# or a CDP hiccup under concurrent renders), which used to crash
+						# the whole PDF with a bare KeyError: 'result'. Retry
+						# synchronously via generate_pdf (the same error-handled path
+						# dynamic headers + the body already use) so one flaky async
+						# header render never loses the entire document.
+						frappe.log_error(
+							title="PDF Generator: async header render failed; retrying synchronously"
+						)
+						self.header_pdf = self.header_page.generate_pdf()
 				else:
 					self.header_pdf = self.header_page.generate_pdf()
 				if not self.debug_mode:
@@ -50,9 +63,16 @@ class Browser:
 
 			if self.footer_page:
 				if not self.is_footer_dynamic:
-					self.footer_pdf = self.footer_page.get_pdf_from_stream(
-						self.footer_page.get_pdf_stream_id()
-					)
+					try:
+						self.footer_pdf = self.footer_page.get_pdf_from_stream(
+							self.footer_page.get_pdf_stream_id()
+						)
+					except Exception:
+						# framework#90 — see the header note above; same sync fallback.
+						frappe.log_error(
+							title="PDF Generator: async footer render failed; retrying synchronously"
+						)
+						self.footer_pdf = self.footer_page.generate_pdf()
 				else:
 					self.footer_pdf = self.footer_page.generate_pdf()
 				if not self.debug_mode:

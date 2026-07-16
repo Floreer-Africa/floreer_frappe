@@ -46,20 +46,28 @@ def resolve_intercepted_public_path(clean_path: str) -> tuple[str, bool]:
 
 
 def classify_intercepted_path(clean_path: str) -> tuple[str, str]:
-	"""Decide how the PDF generator should handle an intercepted same-host
-	sub-resource. Returns ``(final_system_path, action)`` where ``action`` is:
+	"""Classify a same-host sub-resource intercepted during PDF generation into an
+	action: ``"serve"`` | ``"block"`` | ``"continue"``.
 
-	- ``"serve"`` — inside the servable tree AND a real file: read + fulfill it.
-	- ``"block"`` — outside the tree (a path-traversal escape): fail the request.
-	- ``"continue"`` — inside the tree but NOT a servable file (the url resolved to
-	  a directory, e.g. the ``public/`` root, or the file is missing): let Chrome
-	  fetch it normally. ``resolve_intercepted_public_path`` reports such a path as
-	  safe (it is within ``public/``), but calling ``frappe.read_file`` on a
-	  non-file raises ``IsADirectoryError`` / ``FileNotFoundError`` and crashes the
-	  CDP listener thread — the render future never resolves and the request hangs
-	  with its DB locks still held. This split keeps a bad sub-resource url from
-	  taking down the whole render (Floreer-Africa/framework#125). Guarded by
-	  ``floreer_app.tests.test_pdf_generator_public_path``.
+	- ``serve``:    resolves inside the servable tree AND is a real file -> read + fulfill
+	- ``block``:    resolves OUTSIDE the tree (path-traversal escape)     -> Fetch.failRequest
+	- ``continue``: inside the tree but NOT a servable file — a directory
+	                (e.g. the ``public/`` root itself) or a missing file  -> Fetch.continueRequest
+
+	PR-Foundry/framework#88 (fork patch) — ``resolve_intercepted_public_path`` reports
+	``is_safe=True`` for anything under the site ``public/`` tree, INCLUDING the
+	``public/`` root directory and any url resolving to a directory / missing file.
+	``frappe.read_file`` then ``open()``s a directory (``IsADirectoryError``) or a
+	missing path (``FileNotFoundError``) INSIDE the CDP listener thread, killing the
+	listener; the render future never resolves and the whole ``get_pdf`` hangs — and
+	in a request context it hangs holding that request's DB locks (the Sales Invoice
+	naming-series ``tabSeries`` FOR UPDATE lock), 1205-timing-out concurrent invoicing
+	(prod 2026-07-16). A directory/missing path must be handled as ``continue`` (let
+	Chrome fetch it normally); hard-failing it instead aborts the headless page load
+	and surfaces as ``KeyError: 'result'`` in ``get_pdf_stream_id`` — the exact failure
+	the widened-``public/`` patch (framework#83) was added to avoid. Upstream-owned —
+	re-verify after any frappe sync. Guarded by
+	``client_app.tests.test_pdf_generator_public_path``.
 	"""
 	import os
 
@@ -69,6 +77,29 @@ def classify_intercepted_path(clean_path: str) -> tuple[str, str]:
 	if os.path.isfile(final_system_path):
 		return final_system_path, "serve"
 	return final_system_path, "continue"
+
+
+def _extract_stream_id(future) -> str:
+	"""Pull the ``Page.printToPDF`` stream handle out of the resolved CDP future.
+
+	PR-Foundry/framework#90 (fork patch) — the ASYNC printToPDF future (used for
+	non-dynamic header/footer pages) can resolve with a CDP **error** (or otherwise
+	no ``result``) instead of a stream — e.g. a near-empty header page (no letter
+	head) or a CDP hiccup under concurrent renders. The original
+	``future["result"]["stream"]`` then crashed the WHOLE render with a bare,
+	undiagnosable ``KeyError: 'result'`` (prod 2026-07-16: POS invoice-email PDFs
+	never rendered). This raises a clear, catchable ``ValueError`` carrying the CDP
+	response instead — mirroring the guard the synchronous ``generate_pdf`` path
+	already has — so ``browser.py`` can fall back to the sync render. Upstream-owned
+	— re-verify after any frappe sync. Guarded by
+	``client_app.tests.test_pdf_generator_public_path``.
+	"""
+	if not isinstance(future, dict) or "result" not in future:
+		raise ValueError(f"Page.printToPDF returned no result: {future!r}")
+	result = future["result"]
+	if not isinstance(result, dict) or "stream" not in result:
+		raise ValueError(f"Page.printToPDF result has no stream handle: {result!r}")
+	return result["stream"]
 
 
 class Page:
@@ -189,10 +220,21 @@ class Page:
 					path = url.replace(get_host_url(), "").split("?v", 1)[0]
 					clean_path = urllib.parse.unquote(path)
 
-					final_system_path, action = classify_intercepted_path(clean_path)
+					action_path, action = classify_intercepted_path(clean_path)
 
 					if action == "serve":
-						content = frappe.read_file(final_system_path, as_base64=True)
+						content = None
+						try:
+							content = frappe.read_file(action_path, as_base64=True)
+						except Exception:
+							# Backstop: a read error must NEVER escape the CDP listener
+							# thread — that kills the listener and hangs the whole render
+							# with the request's DB locks held (framework#88). Log and
+							# fall through to continueRequest below.
+							frappe.log_error(
+								title="PDF Generator: sub-resource read failed",
+								message=f"path {path} -> {action_path}\n{frappe.get_traceback()}",
+							)
 						response_headers = []
 						# write logic to handle all file types as required
 						if path.endswith(".svg"):
@@ -209,7 +251,7 @@ class Page:
 								return_future=True,
 							)
 							return
-					elif action == "block" and path:
+					elif action == "block":
 						self.session.send(
 							"Fetch.failRequest",
 							{"requestId": data["request_id"], "errorReason": "AccessDenied"},
@@ -217,9 +259,11 @@ class Page:
 						)
 						frappe.log_error(
 							title="Attempted Unauthorized File Access in PDF Generator",
-							message=f"Blocked access to: {path} \nResolved Path to: {final_system_path}",
+							message=f"Blocked access to: {path} \nResolved Path to: {action_path}",
 						)
 						return
+					# action == "continue" (directory / missing / non-file inside the
+					# tree) falls through to Fetch.continueRequest below.
 				self.session.send(
 					"Fetch.continueRequest",
 					{"requestId": data["request_id"]},
@@ -442,8 +486,9 @@ class Page:
 		# wait for event to complete
 		task = self.wait_for_pdf.result()
 		future = task.result()
-		stream_id = future["result"]["stream"]
-		return stream_id
+		# framework#90 — guard a CDP error / no-result future instead of a bare
+		# future["result"]["stream"] KeyError that crashes the whole render.
+		return _extract_stream_id(future)
 
 	def get_pdf_from_stream(self, stream_id, raw=False):
 		from io import BytesIO
