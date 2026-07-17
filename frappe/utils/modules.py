@@ -17,7 +17,15 @@ def get_modules_from_all_apps_for_user(user: str | None = None) -> list[dict]:
 def get_modules_from_all_apps():
 	modules_list = []
 	for app in frappe.get_installed_apps():
-		modules_list += get_modules_from_app(app)
+		# PR-Foundry/framework#93 — get_modules_from_app is @redis_cache-decorated,
+		# and the redis_cache wrapper's documented edge case (caching.py) returns
+		# None when a cache key exists but reads back as None (cold-cache / worker
+		# race, esp. right after a restart). An unguarded `+= None` crashed the whole
+		# /apps launcher permission check (TypeError: NoneType not iterable), which
+		# every app's check_app_permission funnels through. `or []` honours the
+		# helper's list[dict] contract at the point the caching layer can break it.
+		# Upstream-owned line — re-verify after any frappe sync.
+		modules_list += get_modules_from_app(app) or []
 	return modules_list
 
 
