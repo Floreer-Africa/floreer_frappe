@@ -8,6 +8,24 @@ from frappe.utils.pdf import get_host_url
 from frappe.utils.print_utils import convert_uom, parse_float_and_unit
 
 
+def is_zero_height_page(height) -> bool:
+	"""PR-Foundry/framework#94 — is a header/footer page's measured content height
+	zero (or negative)?
+
+	A header/footer that renders to zero height (an invoice with no letterhead /
+	an empty header) would set that page's ``paperHeight`` to 0, which CDP's
+	``Page.printToPDF`` rejects with ``-32602 'paper height is zero or negative'``
+	— crashing the whole invoice PDF/email (even via the #90 async→sync fallback,
+	since the page is genuinely zero-height). Such a page has nothing to render and
+	must be dropped (treated as *no* header/footer). An unmeasured height (``None``)
+	is NOT treated as zero, so a real header is never dropped by mistake.
+	"""
+	try:
+		return height is not None and float(height) <= 0
+	except (TypeError, ValueError):
+		return False
+
+
 class Browser:
 	def __init__(self, generator, print_format, html, options):
 		self.is_print_designer = frappe.get_cached_value("Print Format", print_format, "print_designer")
@@ -189,7 +207,19 @@ class Browser:
 		if self.header_page:
 			self.header_page.wait_for_set_content()
 			self.header_height = self.header_page.get_element_height()
-			self.is_header_dynamic = self.is_page_no_used(self.header_content)
+			# framework#94 — a zero-height header (no letterhead / empty header) IS
+			# no header: drop the page so the render + merge skip it (and the CDP
+			# -32602 zero-paper-height crash never happens), then apply the same
+			# no-header margin fallback the `else` branch uses below.
+			if is_zero_height_page(self.header_height):
+				if not self.debug_mode:
+					self.header_page.close()
+				self.header_page = None
+				self.is_header_dynamic = False
+				if "margin-top" not in options:
+					options["margin-top"] = "15mm"
+			else:
+				self.is_header_dynamic = self.is_page_no_used(self.header_content)
 			del self.header_content
 		else:
 			# Fallback only when the caller did not explicitly pass margin-top.
@@ -200,7 +230,16 @@ class Browser:
 		if self.footer_page:
 			self.footer_page.wait_for_set_content()
 			self.footer_height = self.footer_page.get_element_height()
-			self.is_footer_dynamic = self.is_page_no_used(self.footer_content)
+			# framework#94 — a zero-height footer IS no footer (see header above).
+			if is_zero_height_page(self.footer_height):
+				if not self.debug_mode:
+					self.footer_page.close()
+				self.footer_page = None
+				self.is_footer_dynamic = False
+				if "margin-bottom" not in options:
+					options["margin-bottom"] = "15mm"
+			else:
+				self.is_footer_dynamic = self.is_page_no_used(self.footer_content)
 			del self.footer_content
 		else:
 			# Fallback only when the caller did not explicitly pass margin-bottom.
