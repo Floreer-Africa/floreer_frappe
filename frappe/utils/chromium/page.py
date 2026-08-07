@@ -1,0 +1,553 @@
+import base64
+import time
+import urllib
+
+import frappe
+from frappe.core.doctype.file.utils import find_file_by_url
+from frappe.utils.pdf import get_host_url
+
+"""
+CDP commands documentation can be found here.
+https://chromedevtools.github.io/devtools-protocol/
+"""
+
+
+def resolve_intercepted_public_path(clean_path: str, query_params: dict | None = None) -> tuple[str, bool]:
+	"""Resolve a same-host resource intercepted during PDF generation and report
+	whether it stays inside the site's servable tree.
+
+	Returns ``(final_system_path, is_safe)``. Three trees are servable:
+
+	- ``assets/…``        -> the bench ``sites/assets`` tree
+	- ``private/files/…`` -> the site's ``private/files`` tree, gated on the session
+	                         user's read permission for the backing File (upstream)
+	- everything else     -> anywhere under the site's ``public/`` root (fork)
+
+	PR-Foundry/framework#83 (fork patch) — the non-asset branch previously
+	required the path under ``public/files`` (native Frappe uploads). Apps that
+	serve public files from another sub-tree — notably ``dfp_external_storage``,
+	which rewrites external-storage File urls to ``/file/<name>/<filename>`` —
+	fell outside that and were hard-blocked (``Fetch.failRequest``). A blocked
+	sub-resource aborts the headless print and surfaces as ``KeyError: 'result'``
+	in ``get_pdf_stream_id``, so e.g. a POS invoice embedding a webshop product
+	image never emails. Widening the boundary to the whole ``public/`` root lets
+	those render (or fall through to an HTTP fetch) while still blocking
+	path-traversal escapes outside ``public/`` / ``assets/`` / ``private/files/``.
+
+	The ``private/files/`` branch is upstream's (frappe ``182e1277``, which also
+	re-homed this module from ``frappe.utils.pdf_generator`` to
+	``frappe.utils.chromium``); it is preserved verbatim so an unreadable private
+	file stays denied. Upstream-owned line — re-verify after any frappe sync.
+	Guarded by ``client_app.tests.test_pdf_generator_public_path``.
+	"""
+	import os
+
+	query_params = query_params or {}
+	bench_sites = os.path.abspath(os.path.join(frappe.utils.get_bench_path(), "sites"))
+
+	if clean_path.startswith("assets/"):
+		base = os.path.abspath(os.path.join(bench_sites, "assets"))
+		final_system_path = os.path.abspath(os.path.join(bench_sites, clean_path))
+		return final_system_path, os.path.commonpath([final_system_path, base]) == base
+
+	if clean_path.startswith("private/files/"):
+		# Upstream: private files are servable, but only to a user who may read the
+		# backing File. Mirrors frappe.utils.response.download_private_file.
+		base = os.path.realpath(frappe.utils.get_site_path("private/files"))
+		final_system_path = os.path.realpath(os.path.join(base, clean_path.removeprefix("private/files/")))
+		can_read = False
+		if frappe.session.user == "Administrator":
+			can_read = True
+		elif frappe.session.user != "Guest":
+			# Prefer the explicit fid; else match any File row with this url.
+			fid: str | None = query_params.get("fid", [None])[0]
+			if find_file_by_url("/" + clean_path, name=fid):
+				can_read = True
+		is_safe = can_read and os.path.commonpath([final_system_path, base]) == base
+		return final_system_path, is_safe
+
+	base = os.path.realpath(frappe.utils.get_site_path("public"))
+	final_system_path = os.path.realpath(os.path.join(base, clean_path))
+	return final_system_path, os.path.commonpath([final_system_path, base]) == base
+
+
+def classify_intercepted_path(clean_path: str, query_params: dict | None = None) -> tuple[str, str]:
+	"""Classify a same-host sub-resource intercepted during PDF generation into an
+	action: ``"serve"`` | ``"block"`` | ``"continue"``.
+
+	- ``serve``:    resolves inside the servable tree AND is a real file -> read + fulfill
+	- ``block``:    resolves OUTSIDE the tree (path-traversal escape)     -> Fetch.failRequest
+	- ``continue``: inside the tree but NOT a servable file — a directory
+	                (e.g. the ``public/`` root itself) or a missing file  -> Fetch.continueRequest
+
+	PR-Foundry/framework#88 (fork patch) — ``resolve_intercepted_public_path`` reports
+	``is_safe=True`` for anything under the site ``public/`` tree, INCLUDING the
+	``public/`` root directory and any url resolving to a directory / missing file.
+	``frappe.read_file`` then ``open()``s a directory (``IsADirectoryError``) or a
+	missing path (``FileNotFoundError``) INSIDE the CDP listener thread, killing the
+	listener; the render future never resolves and the whole ``get_pdf`` hangs — and
+	in a request context it hangs holding that request's DB locks (the Sales Invoice
+	naming-series ``tabSeries`` FOR UPDATE lock), 1205-timing-out concurrent invoicing
+	(prod 2026-07-16). A directory/missing path must be handled as ``continue`` (let
+	Chrome fetch it normally); hard-failing it instead aborts the headless page load
+	and surfaces as ``KeyError: 'result'`` in ``get_pdf_stream_id`` — the exact failure
+	the widened-``public/`` patch (framework#83) was added to avoid. Upstream-owned —
+	re-verify after any frappe sync. Guarded by
+	``client_app.tests.test_pdf_generator_public_path``.
+	"""
+	import os
+
+	final_system_path, is_safe = resolve_intercepted_public_path(clean_path, query_params)
+	if not is_safe:
+		return final_system_path, "block"
+	if os.path.isfile(final_system_path):
+		return final_system_path, "serve"
+	return final_system_path, "continue"
+
+
+def _extract_stream_id(future) -> str:
+	"""Pull the ``Page.printToPDF`` stream handle out of the resolved CDP future.
+
+	PR-Foundry/framework#90 (fork patch) — the ASYNC printToPDF future (used for
+	non-dynamic header/footer pages) can resolve with a CDP **error** (or otherwise
+	no ``result``) instead of a stream — e.g. a near-empty header page (no letter
+	head) or a CDP hiccup under concurrent renders. The original
+	``future["result"]["stream"]`` then crashed the WHOLE render with a bare,
+	undiagnosable ``KeyError: 'result'`` (prod 2026-07-16: POS invoice-email PDFs
+	never rendered). This raises a clear, catchable ``ValueError`` carrying the CDP
+	response instead — mirroring the guard the synchronous ``generate_pdf`` path
+	already has — so ``browser.py`` can fall back to the sync render. Upstream-owned
+	— re-verify after any frappe sync. Guarded by
+	``client_app.tests.test_pdf_generator_public_path``.
+	"""
+	if not isinstance(future, dict) or "result" not in future:
+		raise ValueError(f"Page.printToPDF returned no result: {future!r}")
+	result = future["result"]
+	if not isinstance(result, dict) or "stream" not in result:
+		raise ValueError(f"Page.printToPDF result has no stream handle: {result!r}")
+	return result["stream"]
+
+
+class Page:
+	def __init__(self, session, browser_context_id, page_type):
+		self.session = session
+		result, error = self.session.send(
+			"Target.createTarget", {"url": "", "browserContextId": browser_context_id}
+		)
+		if error:
+			frappe.log_error(title="Error creating new page:", message=f"{error}")
+
+		self.target_id = result["targetId"]
+		self.type = page_type
+		result, error = self.session.send(
+			"Target.attachToTarget", {"targetId": self.target_id, "flatten": True}
+		)
+		if error:
+			raise RuntimeError(f"Error attaching to target: {error}")
+		self.session_id = result["sessionId"]
+		self.send("Page.enable")
+		self.frame_id = None
+		self.get_frame_id_on_demand()
+		self.set_media_emulation("print")
+		self.set_cookies()
+
+	# TODO: make send to return future and don't wait for it by default.
+	def send(self, method, params=None, return_future=False):
+		if params is None:
+			params = {}
+		return self.session.send(method, params, self.session_id, return_future)
+
+	def get_frame_id_on_demand(self):
+		if self.frame_id:
+			return self.frame_id
+		try:
+			result, error = self.send("Page.getFrameTree")
+			if error:
+				raise RuntimeError(f"Error fetching frameId: {error}")
+			frame_tree = result["frameTree"]
+			frame = frame_tree["frame"]
+			self.frame_id = frame["id"]
+			return self.frame_id
+		except Exception:
+			frappe.log_error(title="Error fetching frameId:", message=f"{frappe.get_traceback()}")
+			raise
+
+	def _ensure_frame_id(self):
+		if not self.frame_id:
+			self.get_frame_id_on_demand()
+		return self.frame_id
+
+	def set_media_emulation(self, media_type: str = "print"):
+		"""Set media emulation for the page."""
+		return self.send("Emulation.setEmulatedMedia", {"media": media_type})
+
+	def set_cookies(self):
+		if frappe.session and frappe.session.sid and hasattr(frappe.local, "request"):
+			domain = frappe.utils.get_host_name().split(":", 1)[0]
+			cookie = {
+				"name": "sid",
+				"value": frappe.session.sid,
+				"domain": domain,
+				"sameSite": "Strict",
+			}
+			_result, error = self.send("Network.enable")
+			if error:
+				raise RuntimeError(f"Error enabling network: {error}")
+			_result, error = self.send("Network.setCookie", cookie)
+			if error:
+				raise RuntimeError(f"Error setting cookie: {error}")
+			_result, error = self.send("Network.disable")
+			if error:
+				raise RuntimeError(f"Error disabling network: {error}")
+
+	def intercept_request_and_fulfill(self, url_pattern):
+		"""Starts intercepting network requests for the given target_id and URL pattern."""
+		data = {}
+
+		def on_request_paused_event(future, response):
+			"""Callback for when a request is paused (intercepted)."""
+			params = response.get("params")
+			if params and params.get("requestId"):
+				data["request_id"] = params["requestId"]
+				if not future.done():
+					future.set_result(data["request_id"])
+
+		# Start listening for requestPaused event
+		event = self.session.start_listener(
+			"Fetch.requestPaused", on_request_paused_event, self.session_id, self.target_id, self.frame_id
+		)
+
+		# Enable request interception for the specified URL pattern
+		self.session.send("Fetch.enable", {"patterns": [{"urlPattern": url_pattern}]})
+
+		def intercept_and_fulfill():
+			self.session.wait_for_event(event)
+			self.session.send(
+				"Fetch.fulfillRequest",
+				{"requestId": event[1].result(), "responseCode": 200},
+				return_future=True,
+			)
+			self.session.remove_listener("Fetch.requestPaused", event)
+
+		return intercept_and_fulfill
+
+	def intercept_request_for_local_resources(self, url_pattern="*"):
+		"""Starts intercepting network requests for the given target_id and URL pattern."""
+		data = {}
+
+		def on_request_paused_event(future, response):
+			"""Callback for when a request is paused (intercepted)."""
+			params = response.get("params")
+			if params and params.get("requestId"):
+				data["request_id"] = params["requestId"]
+				url = params["request"]["url"]
+
+				if isinstance(url, str) and url.startswith(get_host_url()):
+					parsed = urllib.parse.urlparse(url)
+					clean_path = urllib.parse.unquote(parsed.path).lstrip("/")
+					query_params = urllib.parse.parse_qs(parsed.query)
+
+					action_path, action = classify_intercepted_path(clean_path, query_params)
+
+					if action == "serve":
+						content = None
+						try:
+							content = frappe.read_file(action_path, as_base64=True)
+						except Exception:
+							# Backstop: a read error must NEVER escape the CDP listener
+							# thread — that kills the listener and hangs the whole render
+							# with the request's DB locks held (framework#88). Log and
+							# fall through to continueRequest below.
+							frappe.log_error(
+								title="PDF Generator: sub-resource read failed",
+								message=f"path {clean_path} -> {action_path}\n{frappe.get_traceback()}",
+							)
+						response_headers = []
+						# write logic to handle all file types as required
+						if clean_path.endswith(".svg"):
+							response_headers.append({"name": "Content-Type", "value": "image/svg+xml"})
+						if content:
+							self.session.send(
+								"Fetch.fulfillRequest",
+								{
+									"requestId": data["request_id"],
+									"responseCode": 200,  # actually hande the response code from the request
+									"responseHeaders": response_headers,
+									"body": content,
+								},
+								return_future=True,
+							)
+							return
+					elif action == "block":
+						self.session.send(
+							"Fetch.failRequest",
+							{"requestId": data["request_id"], "errorReason": "AccessDenied"},
+							return_future=True,
+						)
+						frappe.log_error(
+							title="Attempted Unauthorized File Access in PDF Generator",
+							message=f"Blocked access to: {clean_path} \nResolved Path to: {action_path}",
+						)
+						return
+					# action == "continue" (directory / missing / non-file inside the
+					# tree) falls through to Fetch.continueRequest below.
+				self.session.send(
+					"Fetch.continueRequest",
+					{"requestId": data["request_id"]},
+					return_future=True,
+				)
+
+		# Start listening for requestPaused event
+		self.session.start_listener(
+			"Fetch.requestPaused", on_request_paused_event, self.session_id, self.target_id, self.frame_id
+		)
+
+		# Enable request interception for the specified URL pattern
+		self.session.send("Fetch.enable", {"patterns": [{"urlPattern": url_pattern}]})
+
+	def set_tab_url(self, url):
+		"""Navigate to a URL and fulfill the request with status code 200."""
+
+		# Intercept and fulfill request with 200 status code
+		wait_and_fulfill = self.intercept_request_and_fulfill(url)
+		# Now, navigate after intercepting the request
+		wait_start = self.wait_for_load(wait_for="load")
+		page_navigate = self.send("Page.navigate", {"url": url}, return_future=True)
+		wait_and_fulfill()
+
+		def wait_for_navigate():
+			self.session.wait_for_event(page_navigate, 3)
+			wait_start()
+
+		self.wait_for_navigate = wait_for_navigate
+
+	def navigate(self, url, wait_for=None):
+		"""Really load a URL and wait for render (vs set_tab_url's empty-body stub)."""
+		wait_start = self.wait_for_load(wait_for=wait_for or ["load", "DOMContentLoaded", "networkIdle"])
+		_result, error = self.send("Page.navigate", {"url": url})
+		if error:
+			raise RuntimeError(f"Error navigating to URL: {error}")
+		wait_start()
+
+	def evaluate(self, expression, await_promise=False):
+		self.send("Runtime.enable")
+		result, error = self.send(
+			"Runtime.evaluate", {"expression": expression, "awaitPromise": await_promise}
+		)
+		if error:
+			# retry if error in 500ms for 3 times (just safe guard as i had few edge cases where it failed).
+			# waiting for network is still slower than this.
+			for _i in range(3):
+				print(f"Error evaluating expression: {error}. Retrying in 500ms")
+				time.sleep(0.5)
+				result, error = self.send(
+					"Runtime.evaluate", {"expression": expression, "awaitPromise": await_promise}
+				)
+				if not error:
+					break
+			raise RuntimeError(f"Error evaluating expression: {error}")
+
+		self.send("Runtime.disable")
+		return result
+
+	# set wait_for to networkIdle if pdf is not rendering correctly.
+	# if you face header Height to be incorrect as some external script is changing elements.
+	# networkIdle is most stable option but make it a lot slower so avoiding for now. enable if not stable
+	def set_content(self, html, wait_for=None):
+		if not wait_for:
+			wait_for = ["load", "DOMContentLoaded"]
+		self.intercept_request_for_local_resources()
+		wait_start = self.wait_for_load(wait_for=wait_for)
+		self.send("Page.setDocumentContent", {"frameId": self._ensure_frame_id(), "html": html})
+		self.wait_for_set_content = wait_start
+
+	def wait_for_load(self, wait_for, timeout=60):
+		self.send("Page.setLifecycleEventsEnabled", {"enabled": True})
+		status = {}
+		if isinstance(wait_for, str):
+			status[wait_for] = False
+		if isinstance(wait_for, list):
+			for event in wait_for:
+				status[event] = False
+
+		def on_lifecycle_event(future, response):
+			params = response.get("params", {})
+			if params.get("name") in status.keys():
+				status[params.get("name")] = True
+				if all(status.values()):
+					if not future.done():
+						future.set_result(response)
+
+		event = self.session.start_listener(
+			"Page.lifecycleEvent", on_lifecycle_event, self.session_id, self.target_id, self.frame_id
+		)
+
+		def start_wait():
+			self.session.wait_for_event(event, timeout)
+			self.session.remove_listener("Page.lifecycleEvent", event)
+
+		return start_wait
+
+	def get_element_height(self, selector="body"):
+		if not self.is_print_designer:
+			selector = ".wrapper"
+
+		# Primary: use the wrapper's own getBoundingClientRect().height.
+		# With display:flow-root on .wrapper (chrome_pdf_header_footer.html) the BFC
+		# guarantees floated children are included in the layout height, so this is
+		# the correct rendered height.
+		#
+		# Fallback (height==0, e.g. unusual letterhead that defeats display:flow-root):
+		# walk in-flow descendants and return the farthest bottom edge.
+		# Absolutely/fixed-positioned descendants are skipped so they can't
+		# inflate the measurement beyond the actual visual content.
+		js = f"""(function() {{
+			var wrapper = document.querySelector('{selector}');
+			if (!wrapper) return 0;
+			var h = wrapper.getBoundingClientRect().height;
+			if (h > 0) return Math.ceil(h);
+			var top = wrapper.getBoundingClientRect().top;
+			var maxBottom = top;
+			var nodes = wrapper.querySelectorAll('*');
+			for (var i = 0; i < nodes.length; i++) {{
+				var pos = window.getComputedStyle(nodes[i]).position;
+				if (pos === 'absolute' || pos === 'fixed') continue;
+				var b = nodes[i].getBoundingClientRect().bottom;
+				if (b > maxBottom) maxBottom = b;
+			}}
+			return Math.ceil(maxBottom - top);
+		}})()"""
+		try:
+			result = self.evaluate(js)
+			height = result.get("result", {}).get("value", 0) or 0
+		except Exception:
+			# Fallback to DOM.getBoxModel if JS evaluation fails entirely
+			try:
+				self.send("DOM.enable")
+				doc_result, _err = self.send("DOM.getDocument")
+				doc_node_id = doc_result["root"]["nodeId"]
+				result, _err = self.send("DOM.querySelector", {"nodeId": doc_node_id, "selector": selector})
+				node_id = result["nodeId"]
+				result, _err = self.send("DOM.getBoxModel", {"nodeId": node_id})
+				height = result["model"]["height"]
+			finally:
+				self.send("DOM.disable")
+		return height
+
+	def add_page_size_css(self):
+		width = str(self.options["paperWidth"]) + "in"
+		height = str(self.options["paperHeight"]) + "in"
+		marginLeft = str(self.options["marginLeft"]) + "in"
+		marginRight = str(self.options["marginRight"]) + "in"
+		marginTop = str(self.options["marginTop"]) + "in"
+		marginBottom = str(self.options["marginBottom"]) + "in"
+
+		# Enable DOM and CSS agents
+		result, error = self.send("DOM.enable")
+		if error:
+			raise RuntimeError(f"Error enabling DOM: {error}")
+
+		result, error = self.send("CSS.enable")
+		if error:
+			raise RuntimeError(f"Error enabling CSS: {error}")
+
+		# Create a new stylesheet
+		result, error = self.send("CSS.createStyleSheet", {"frameId": self._ensure_frame_id()})
+		if error:
+			raise RuntimeError(f"Error creating stylesheet: {error}")
+
+		style_sheet_id = result["styleSheetId"]
+
+		# Define the CSS rule for the page size
+		css_rule = f"""
+			@page {{
+				size: {width} {height};
+				margin: {marginTop} {marginRight} {marginBottom} {marginLeft};
+			}}
+		"""
+
+		# Apply the CSS rule to the created stylesheet
+		result, error = self.send("CSS.setStyleSheetText", {"styleSheetId": style_sheet_id, "text": css_rule})
+
+		if error:
+			raise RuntimeError(f"Error setting stylesheet text: {error}")
+
+		self.send("CSS.disable")
+		self.send("DOM.disable")
+
+	def set_device_metrics(self, width=1280, height=720, scale_factor=1):
+		"""Override viewport size for deterministic screenshot dimensions (default 1280x720)."""
+		_result, error = self.send(
+			"Emulation.setDeviceMetricsOverride",
+			{"width": width, "height": height, "deviceScaleFactor": scale_factor, "mobile": False},
+		)
+		if error:
+			raise RuntimeError(f"Error setting device metrics: {error}")
+
+	def capture_screenshot(self, image_format="jpeg", quality=30):
+		"""Screenshot the current viewport; returns raw image bytes."""
+		params = {"format": image_format, "captureBeyondViewport": False}
+		if image_format in ("jpeg", "webp"):  # quality is only valid for lossy formats
+			params["quality"] = quality
+		result, error = self.send("Page.captureScreenshot", params)
+		if error:
+			raise RuntimeError(f"Error capturing screenshot: {error}")
+		return base64.b64decode(result["data"])
+
+	def generate_pdf(self, wait_for_pdf=True, raw=False):
+		self.add_page_size_css()
+		if not wait_for_pdf:
+			self.wait_for_pdf = self.send("Page.printToPDF", self.options, return_future=True)
+			return
+
+		result, error = self.send("Page.printToPDF", self.options)
+		if error:
+			raise RuntimeError(f"Error generating PDF: {error}")
+		if "stream" not in result:
+			raise ValueError("Stream handle not returned from Page.printToPDF")
+		return self.get_pdf_from_stream(result["stream"], raw)
+
+	def get_pdf_stream_id(self):
+		# wait for task to complete
+		self.session.wait_for_event(self.wait_for_pdf)
+		# wait for event to complete
+		task = self.wait_for_pdf.result()
+		future = task.result()
+		# framework#90 — guard a CDP error / no-result future instead of a bare
+		# future["result"]["stream"] KeyError that crashes the whole render.
+		return _extract_stream_id(future)
+
+	def get_pdf_from_stream(self, stream_id, raw=False):
+		from io import BytesIO
+
+		from pypdf import PdfReader
+
+		pdf_data = b""
+		offset = 0
+		while True:
+			chunk_result, error = self.send("IO.read", {"handle": stream_id, "offset": offset, "size": 4096})
+			if error:
+				raise RuntimeError(f"Error reading PDF chunk: {error}")
+			chunk_data = chunk_result["data"]
+			# we don't use base64Encode option but added check anyway as it is one of the valid options.
+			if chunk_result.get("base64Encoded", False):
+				chunk_data = base64.b64decode(chunk_data)
+			pdf_data += chunk_data
+			offset += len(chunk_data)
+			if chunk_result.get("eof", False):
+				break
+
+		_result, error = self.send("IO.close", {"handle": stream_id})
+		if error:
+			raise RuntimeError(f"Error closing PDF stream: {error}")
+
+		if raw:
+			return pdf_data
+
+		return PdfReader(BytesIO(pdf_data))
+
+	def close(self):
+		self.session.send("Fetch.disable")
+		_result, error = self.send("Target.closeTarget", {"targetId": self.target_id})
+		if error:
+			raise RuntimeError(f"Error closing target: {error}")
