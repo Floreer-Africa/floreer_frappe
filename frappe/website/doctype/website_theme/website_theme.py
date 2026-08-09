@@ -1,6 +1,7 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and contributors
 # License: MIT. See LICENSE
 
+import re
 from os.path import abspath, splitext
 from os.path import exists as path_exists
 from os.path import join as join_path
@@ -120,6 +121,7 @@ class WebsiteTheme(Document):
 			stderr = stderr.replace("\n", "<br>")
 			frappe.throw(f'<div style="font-family: monospace;">{stderr}</div>')
 		else:
+			absolutify_app_asset_imports(output_path)
 			self.theme_url = "/files/website_theme/" + file_name
 
 		frappe.msgprint(_("Compiled Successfully"), alert=True)
@@ -160,6 +162,50 @@ def get_active_theme() -> "WebsiteTheme" | None:
 		except frappe.DoesNotExistError:
 			frappe.clear_last_message()
 			pass
+
+
+#: `@import "<app>/public/<rest>"` → the URL that actually serves it, `/assets/<app>/<rest>`.
+#: Anchored to the start of the quoted value so already-absolute (`/assets/…`) and remote
+#: (`https://…`) imports are left alone, and the import must be a bare app-relative path.
+APP_ASSET_IMPORT = re.compile(
+	r"""(@import\s*(?:url\(\s*)?)(['"])(?!/|https?:|data:)([a-z0-9_]+)/public/([^'"]+)\2""",
+	re.IGNORECASE,
+)
+
+
+def absolutify_app_asset_imports(css_path):
+	"""Rewrite app-relative plain-CSS `@import`s in a generated theme file (framework#171).
+
+	Dart Sass treats `@import "…/x.css"` as a **plain CSS import** and emits it
+	verbatim instead of inlining it. `frappe/public/scss/espresso_components.scss`
+	imports 17 component files that way, and the website theme pulls it in — so the
+	compiled theme keeps ~30 literal `@import "frappe/public/css/espresso/…"` lines.
+
+	The bundles are fine: esbuild resolves those at build time. This file is not
+	bundled — it is written to `sites/public/files/website_theme/` and served from
+	`/files/website_theme/`, so the browser resolves each relative import against
+	*that* directory (`/files/website_theme/frappe/public/css/…`), which does not
+	exist. Every one 404/502s with an HTML body, so the browser refuses it as the
+	wrong MIME type and the espresso base styles never load — 30 failed requests on
+	every page view, on every site using a custom theme.
+
+	`public/` is dropped because that is exactly how Frappe serves app assets:
+	`<app>/public/css/x.css` is published at `/assets/<app>/css/x.css`.
+
+	Idempotent: already-absolute and remote imports do not match the pattern.
+	"""
+	try:
+		with open(css_path, encoding="utf-8") as f:
+			css = f.read()
+	except OSError:
+		return  # never fail a theme compile over a cosmetic rewrite
+
+	rewritten, count = APP_ASSET_IMPORT.subn(r"\1\g<2>/assets/\3/\4\2", css)
+	if not count:
+		return
+
+	with open(css_path, "w", encoding="utf-8") as f:
+		f.write(rewritten)
 
 
 def get_scss(website_theme):
