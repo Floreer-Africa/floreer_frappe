@@ -378,7 +378,17 @@ def handle_exception(e):
 		and (frappe.db and isinstance(e, frappe.db.InternalError))
 		and (frappe.db and (frappe.db.is_deadlocked(e) or frappe.db.is_timedout(e)))
 	):
+		# framework#196 — upstream changes the status code here but never builds a
+		# response, so `response` stays None and werkzeug's @Request.application
+		# calls None as a WSGI app: "TypeError: 'NoneType' object is not callable".
+		# The client gets an opaque 500 and Frappe writes NO Error Log row, so a
+		# deadlock on any browser (non-JSON) request is invisible server-side.
 		http_status_code = 508
+		response = ErrorPage(
+			http_status_code=http_status_code,
+			title=_("Server Busy"),
+			message=_("The server is busy processing another request. Please try again in a moment."),
+		).render()
 
 	elif http_status_code == 401:
 		response = ErrorPage(
@@ -419,6 +429,21 @@ def handle_exception(e):
 	if frappe.conf.get("developer_mode") and not respond_as_json:
 		# don't fail silently for non-json response errors
 		print(frappe.get_traceback())
+
+	if response is None:
+		# framework#196 — belt-and-braces. `application()` documents that it *must*
+		# always return a response; a branch above that forgets to build one turns a
+		# handled exception into an opaque werkzeug TypeError with no Error Log row.
+		# Log it so the next such branch is diagnosable instead of invisible.
+		frappe.log_error(
+			title="handle_exception produced no response",
+			message=f"status={http_status_code} exc={type(e).__name__}\n{frappe.get_traceback()}",
+		)
+		response = ErrorPage(
+			http_status_code=http_status_code or 500,
+			title=_("Server Error"),
+			message=_("Uncaught Exception"),
+		).render()
 
 	return response
 

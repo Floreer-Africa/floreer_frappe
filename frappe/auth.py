@@ -31,6 +31,18 @@ UNSAFE_HTTP_METHODS = frozenset(("POST", "PUT", "DELETE", "PATCH"))
 assert SAFE_HTTP_METHODS.isdisjoint(UNSAFE_HTTP_METHODS), "a HTTP method cannot be both safe and unsafe"
 MAX_PASSWORD_SIZE = 512
 
+# framework#196 — 293 of 353 enabled Website Users on production have NO password hash
+# at all: they were imported from the previous app, and password hashes cannot be
+# migrated. For them a password login can never succeed, and a bare "Invalid login
+# credentials" reads as "you typed it wrong" and sends them round the same loop.
+#
+# The hint is UNCONDITIONAL on purpose. Branching it on "this account has no password"
+# would disclose account existence to an attacker (CWE-204) — precisely what the single
+# generic message exists to prevent. Every failed login gets the identical string.
+INVALID_CREDENTIALS_MESSAGE = (
+	"Invalid login credentials. If you have not set a password yet, use Forgot Password to create one."
+)
+
 
 class HTTPRequest:
 	def __init__(self):
@@ -283,7 +295,7 @@ class LoginManager:
 		ip_tracker = get_login_attempt_tracker(frappe.local.request_ip)
 		if not user:
 			ip_tracker and ip_tracker.add_failure_attempt()
-			self.fail("Invalid login credentials", user=_raw_user_name)
+			self.fail(INVALID_CREDENTIALS_MESSAGE, user=_raw_user_name)
 
 		# Current login flow uses cached credentials for authentication while checking OTP.
 		# Incase of OTP check, tracker for auth needs to be disabled(If not, it can remove tracker history as it is going to succeed anyway)
@@ -294,7 +306,7 @@ class LoginManager:
 		if not user.is_authenticated:
 			user_tracker and user_tracker.add_failure_attempt()
 			ip_tracker and ip_tracker.add_failure_attempt()
-			self.fail("Invalid login credentials", user=user.name)
+			self.fail(INVALID_CREDENTIALS_MESSAGE, user=user.name)
 		elif not (user.name == "Administrator" or user.enabled):
 			user_tracker and user_tracker.add_failure_attempt()
 			ip_tracker and ip_tracker.add_failure_attempt()
