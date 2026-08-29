@@ -355,7 +355,19 @@ def create_desktop_icons_from_workspace():
 					):
 						icon.insert(ignore_if_duplicate=True)
 				except Exception as e:
-					frappe.error_log(title="Creation of Desktop Icon Failed", message=e)
+					# PR-Foundry/framework#144: was `frappe.error_log(...)`, which is a
+					# LocalProxy over a LIST (frappe/__init__.py), not a function — so this
+					# handler raised `TypeError: 'list' object is not callable`, escaped the
+					# per-workspace try, aborted the whole loop and destroyed the real
+					# exception. `link_to` is a Dynamic Link on `link_type`, i.e. the DocType
+					# `Workspace Sidebar`, so EVERY workspace with no same-named Workspace
+					# Sidebar record legitimately raises LinkValidationError here (11 of 47
+					# on a stock site, core Users/Website/Email/System among them). That must
+					# degrade per workspace and be diagnosable, not take out the rest.
+					frappe.log_error(
+						title="Creation of Desktop Icon Failed",
+						message=f"{icon.label}: {e}",
+					)
 
 
 def create_desktop_icons_from_installed_apps():
