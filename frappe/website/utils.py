@@ -114,7 +114,12 @@ def get_home_page():
 				pass
 			else:
 				for x in all_home_pages:
-					if x is not None:
+					# Truthiness, not `is not None` (framework#208). Frappe's Desk
+					# UI writes "" — never NULL — when a Data field is cleared, so
+					# an empty Role.home_page is a value that wins this race and
+					# then falls through as falsy to default_portal_home. A role
+					# with an empty home page does not have one.
+					if x:
 						home_page = x
 						break
 
