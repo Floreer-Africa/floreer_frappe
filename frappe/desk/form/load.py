@@ -127,7 +127,7 @@ def get_docinfo(
 			"shared": get_docshares(doc),
 			"views": get_view_logs(doc),
 			"additional_timeline_content": get_additional_timeline_content(doc.doctype, doc.name),
-			"milestones": get_milestones(doc.doctype, doc.name),
+			"milestones": get_milestones(doc.doctype, doc.name, limit=0),
 			"is_document_followed": is_document_followed(doc.doctype, doc.name, frappe.session.user),
 			"tags": get_tags(doc.doctype, doc.name),
 			"document_email": get_document_email(doc.doctype, doc.name),
@@ -176,11 +176,16 @@ def add_comments(doc, docinfo):
 	return comments
 
 
-def get_milestones(doctype, name):
+def get_milestones(doctype, name, start=0, limit=20):
+	# Newest first and paged: a long-lived document accumulates these without end. The page runs
+	# larger than the one on versions because a milestone row is four short columns, not a JSON diff.
 	return frappe.get_all(
 		"Milestone",
-		fields=["creation", "owner", "track_field", "value"],
+		fields=["name", "creation", "owner", "track_field", "value"],
 		filters=dict(reference_type=doctype, reference_name=str(name)),
+		limit_start=start,
+		limit=limit,
+		order_by="creation desc",
 	)
 
 
@@ -206,9 +211,12 @@ def get_filtered_attachments(dt: str, dn: str | int, filters: str):
 	frappe.get_doc(dt, dn).check_permission("read")
 	filters = frappe.parse_json(filters)
 	if not isinstance(filters, list) or any(
-		not isinstance(filter_row, list) or len(filter_row) != 4 for filter_row in filters
+		not isinstance(filter_row, list)
+		or len(filter_row) != 4
+		or not all(isinstance(value, str) for value in filter_row[:3])
+		for filter_row in filters
 	):
-		frappe.throw(_("Filters must be a list of four-value filter rows."))
+		frappe.throw(_("Filters must be four-value rows with string doctypes, fields, and operators."))
 	if any(filter_row[0] != "File" for filter_row in filters):
 		frappe.throw(_("Attachment Gallery filters must target File."))
 
@@ -236,13 +244,17 @@ def get_filtered_attachments(dt: str, dn: str | int, filters: str):
 def get_versions(doc: "Document") -> list[dict]:
 	if not doc.meta.track_changes:
 		return []
-	return frappe.get_all(
+
+	from frappe.model.utils.mask import mask_version_data
+
+	versions = frappe.get_all(
 		"Version",
 		filters=dict(ref_doctype=doc.doctype, docname=str(doc.name)),
 		fields=["name", "owner", "creation", "data"],
 		limit=10,
 		order_by="creation desc",
 	)
+	return mask_version_data(versions, doc.doctype)
 
 
 @frappe.whitelist()

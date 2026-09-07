@@ -338,14 +338,15 @@ class Page:
 			# retry if error in 500ms for 3 times (just safe guard as i had few edge cases where it failed).
 			# waiting for network is still slower than this.
 			for _i in range(3):
-				print(f"Error evaluating expression: {error}. Retrying in 500ms")
 				time.sleep(0.5)
 				result, error = self.send(
 					"Runtime.evaluate", {"expression": expression, "awaitPromise": await_promise}
 				)
 				if not error:
 					break
-			raise RuntimeError(f"Error evaluating expression: {error}")
+			if error:
+				self.send("Runtime.disable")
+				raise RuntimeError(f"Error evaluating expression: {error}")
 
 		self.send("Runtime.disable")
 		return result
@@ -508,14 +509,21 @@ class Page:
 		return self.get_pdf_from_stream(result["stream"], raw)
 
 	def get_pdf_stream_id(self):
-		# wait for task to complete
+		# wait for the send task to complete; its result is the response future
 		self.session.wait_for_event(self.wait_for_pdf)
-		# wait for event to complete
-		task = self.wait_for_pdf.result()
-		future = task.result()
-		# framework#90 — guard a CDP error / no-result future instead of a bare
-		# future["result"]["stream"] KeyError that crashes the whole render.
-		return _extract_stream_id(future)
+		response_future = self.wait_for_pdf.result()
+		# the task resolves when the command is *sent*, so also wait for the
+		# Page.printToPDF response before reading the stream handle
+		self.session.wait_for_event(response_future, timeout=30)
+		if not response_future.done() or response_future.cancelled():
+			raise RuntimeError("Timed out waiting for the Page.printToPDF response")
+		response = response_future.result()
+		# PR-Foundry/framework#90 — upstream reads response["result"]["stream"] bare, which
+		# crashes the WHOLE render with an undiagnosable KeyError when the async future
+		# resolves with a CDP *error* instead of a stream (a zero-height header page, a
+		# hiccup under concurrent renders). Route it through the guard so browser.py can
+		# catch a ValueError and fall back to the sync render. Re-verify after any sync.
+		return _extract_stream_id(response)
 
 	def get_pdf_from_stream(self, stream_id, raw=False):
 		from io import BytesIO
